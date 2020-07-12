@@ -1,0 +1,160 @@
+---
+title: "Step by step instructions to apply the matrix-based method using R"
+output:
+  word_document: default
+  html_notebook: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+The analyses are carried out using the R software. The MCMC is performed using the `Stan` library (http://mc-stan.org) via the `rstan` package. The integrated likelihood is obtained using the `bridge_sampler` function of the `bridgesampling` package. This approach is now detailed.
+
+# Obtaining and installing R
+
+R is a programming language and free software environment for statistical computing and graphics supported by the R Foundation for Statistical Computing. Sources binaries, documentation and additional packages can be obtained via the CRAN [http://cran.R-project.org](http://cran.R-project.org). It is available for a wide range of operating systems (Windows, Linux, Mac OS, ...).
+
+# Installing `rstan` and `bridgesampling` packages
+
+To carry out our Bayesian analysis it is necessary to install the `rstan` and `bridgesampling` packages, it can be performed by running the following command lines:
+```{r, eval=FALSE}
+install.packages("rstan")
+install.packages("bridgesampling")
+```
+
+Some particular attention may be taken for the `rstan` package installation, since it requires an operational C++ compiler for running the underlying Stan program. See [https://mc-stan.org/users/interfaces/rstan](https://mc-stan.org/users/interfaces/rstan) for more details.
+
+
+# Reading the discovery matrix
+
+R can read a variety of format see for instance [R Data Import/Export manual](https://cran.r-project.org/doc/manuals/r-release/R-data.html). In particular it can read csv (comma separated values) files which can be obtained from MS Excel Save menu. Let consider the `d.csv` file, it can be imported in R through the following command line: 
+```{r}
+d = read.csv("d.csv")
+class(d)
+d[1:5,1:21]
+```
+
+The data-frame `d` can then be converted into matrix through the `as.matrix` command:
+```{r}
+d = as.matrix(d)
+class(d)
+```
+
+# Performing the MCMC algorithm through `rstan` for a given $m$
+
+Our aim is to draw values coming from $p(m, \mu, \sigma^2 |{\bf d})$. To do this we will first draw $\mu$ et $\sigma^2$ for  each possible value of $m$, $m\in \{1, \ldots, M\}$: i.e. $p(\mu , \sigma | m, {\bf d})$ and deduce a numerical approximation of $p({\bf d}|m)$ from the Monte-Carlo sample. Finally it will be possible to deduce $p(m | {\bf d})$ from Bayes formula.
+
+## Sampling from $p(\mu , \sigma^2 | m, {\bf d})$ with `rstan`
+
+First: 
+$$
+p(\mu , \sigma^2 | m, {\bf d}) \propto p({\bf d}|\mu, \sigma^2, m)p(\mu)p(\sigma^2)p(m)
+$$
+
+Second:
+$$
+p({\bf d}|\mu, \sigma^2, m) \propto  A_m^j \times p(\hat{\bf x}^m|\mu, \sigma^2)
+$$
+where $\hat{\bf x}^m$ is the ${\bf d}$ matrix padded with $m-j$ null columns.  
+
+Thus in practice for $m$ fixed we will consider sampling from $p(\mu,\sigma^2|\hat{\bf x}^m)$, deduce the integrated likelihood $p(\hat{\bf x}^m)$ using bridge sampling and get $p({\bf d}|m)$ up to a multiplicative constant not depending of $m$. 
+
+In order to perform the simulation of the parameters $\mu$ and $\sigma^2$ given $\hat{\bf x}^m$ we will consider the parameter space augmented by $p_1$, \ldots, $p_m$, the discovery probabilities associated with each column of $\hat{\bf x}^m$. Thus we will now sample from $\mu, \sigma^2, p_1, \ldots, p_m | \hat{\bf x}^m$.
+
+The resulting Stan model is described in the `draw_mu_s2.stan` file. This file basically specifies the prior distribution on the parameters and the likelihood of the model.
+
+The first step is to load the `rstan` package through the command line: 
+```{r,message=FALSE}
+library(rstan)
+```
+
+Then to compile the Stan file for latter use: 
+```{r, message = FALSE}
+model <- stan_model('draw_mu_s2.stan')
+```
+
+The Stan model can now be used to sample from the posterior distribution given the data: $\mu, \sigma^2, p_1, \ldots, p_m | \hat{\bf x}^m$. 
+
+For instance, for $m=30$, we compute the required usability summary data 
+```{r}
+set.seed(1234) # to get reproducible results
+m = 30 
+j = ncol(d)
+n = nrow(d)
+nl = colSums(d)
+x <- c(nl, rep(0, m - j)) # exhaustive statistic according to the model
+usability_dat <- list(n = n, m = m, x = x, mu_prior_mean = 0, 
+                          mu_prior_sd = 10000, s2_prior_a = 0.5,
+                          s2_prior_b = 0.5)
+```
+
+Then the object `usability_dat`, is used as input for the Stan program through the use of the `sampling` function of `rstan`: 
+```{r}
+fit <- sampling(object = model,  data = usability_dat, refresh = 0)
+```
+
+Sampled values for the given value $m$ can eventually be extracted: 
+```{r}
+mu = do.call("c", lapply(fit@sim$samples, function(x) x$mu[1001:2000]))
+# Where 1000 first burn in iterations are removed
+s2 = do.call("c", lapply(fit@sim$samples, function(x) x$s2[1001:2000]))   
+simu = cbind(mu = mu, s2 = s2, m = m)
+head(simu)
+```
+
+## Obtaining the integrated likelihood through the `bridgesampling` package
+
+The posterior sample can then be used as an input of the `bridge_sampler` function of the `bridgesampling` package in order to compute the log of the integrated likelihood $\log p({\bf x}_m)$: 
+```{r}
+library(bridgesampling)
+lp <- bridge_sampler(fit,silent = TRUE)$logml
+```
+
+Then the log of the $p({\bf d}| m)$ can be obtained from 
+$$
+\log p({\bf d}| m) = \log  A_m^j + \log  p(\hat{\bf x}^m) + C
+$$
+where $C$ is a constant not depending of $m$.
+
+```{r}
+lp <- lp + lchoose(m,j)
+```
+where `lchoose(m,j)`$=\log  A_m^j - \log j!$.
+ 
+Making such computation for each possible value of $m$ and by using the Bayes formula we get $p(m|{\bf d})$.
+
+# Performing the whole approche through the `heterogeneous_bayes` function
+
+The whole approach is implemented in the file `functions.R`. This file can simply be sourced:
+```{r,message = FALSE}
+source("functions.R")
+```
+
+Then it is possible to use the `heterogenous_bayes` function in the following way:
+```{r}
+mbest = heterogeneous_bayes(d, M = 50)
+mbest
+```
+where $M$ is the maximum number of problem. Here by default we only return the value maximizing $p(m|{\bf d})$. However we can also return more information with the option `full_output = TRUE`:
+```{r}
+full_output = heterogeneous_bayes(d, M = 50,full_output = TRUE)
+str(full_output)
+```
+
+It is possible to look at the posterior distribution of $m$:
+```{r}
+plot(full_output$posterior_m,type = "h", main = "Posterior distribution p(m|d)")
+```
+
+Or to look at the sampled values of $\mu$ and $\sigma^2$ given $m$: 
+```{r}
+head(full_output$simu_mu_s2)
+```
+
+
+
+
+
+
+
+
